@@ -22,55 +22,21 @@ internal partial interface IWTSVirtualChannelCallback
     void OnClose();
 }
 
-[GeneratedComClass]
-internal partial class WTSVirtualChannelCallback : IWTSVirtualChannelCallback
-{
-    public void OnClose()
-    {
-        throw new NotImplementedException();
-    }
-
-    public void OnDataReceived(int cbSize, nint pBuffer)
-    {
-        throw new NotImplementedException();
-    }
-}
-
 [GeneratedComInterface]
 [Guid("a1230203-d6a7-11d8-b9fd-000bdbd1f198")]
 internal partial interface IWTSListenerCallback
 {
-    IWTSVirtualChannelCallback OnNewChannelConnection(
+    IWTSVirtualChannelCallback? OnNewChannelConnection(
         [MarshalAs(UnmanagedType.Interface)] IWTSVirtualChannel pChannel,
         [MarshalAs(UnmanagedType.BStr)] string data,
         [MarshalAs(UnmanagedType.Bool)] out bool pbAccept);
-}
-
-[GeneratedComClass]
-internal partial class WTSListenerCallback : IWTSListenerCallback
-{
-    public IWTSVirtualChannelCallback OnNewChannelConnection(
-        IWTSVirtualChannel pChannel,
-        string data,
-        out bool pbAccept)
-    {
-        throw new NotImplementedException();
-    }
-}
-
-[GeneratedComInterface]
-[Guid("a1230206-9a39-4d58-8674-cdb4dff4e73b")]
-internal partial interface IWTSListener
-{
-    // IPropertyBag
-    nint GetConfiguration();
 }
 
 [GeneratedComInterface]
 [Guid("a1230205-d6a7-11d8-b9fd-000bdbd1f198")]
 internal partial interface IWTSVirtualChannelManager
 {
-    IWTSListener CreateListener(
+    nint CreateListener(
         [MarshalAs(UnmanagedType.LPStr)] string pszChannelName,
         int uFlags,
         [MarshalAs(UnmanagedType.Interface)] IWTSListenerCallback pListenerCallback);
@@ -88,17 +54,55 @@ internal partial interface IWTSPlugin
 }
 
 [GeneratedComClass]
-internal partial class WTSPlugin : IWTSPlugin
+internal partial class WTSVirtualChannelCallback : IWTSVirtualChannelCallback
+{
+    private readonly IWTSVirtualChannel _channel;
+    internal StreamWriter? _log;
+
+    public WTSVirtualChannelCallback(IWTSVirtualChannel channel)
+    {
+        _channel = channel;
+    }
+
+    public void OnClose()
+    {
+        Log("OnClose");
+    }
+
+    public void OnDataReceived(int cbSize, nint pBuffer)
+    {
+        Span<byte> data;
+        unsafe
+        {
+            data = new((void*)pBuffer, cbSize);
+        }
+
+        Log($"OnDataReceived({cbSize}) - {Convert.ToHexString(data)}");
+        _channel.Write(cbSize, pBuffer, 0);
+    }
+
+    private void Log(string msg)
+    {
+        string logPath = @"C:\temp\ProcessVirtualChannel\WTSVirtualChannelCallback-log.txt";
+        _log ??= new(logPath, false);
+        string now = DateTime.Now.ToString("[HH:mm:ss.fff]");
+        _log.WriteLine($"{now} - {msg}");
+        _log.Flush();
+    }
+}
+
+[GeneratedComClass]
+internal partial class WTSPlugin : IWTSPlugin, IWTSListenerCallback
 {
     internal StreamWriter? _log;
 
     public void Initialize(IWTSVirtualChannelManager pChannelMgr)
     {
         Log("Initialize");
-        // pChannelMgr.CreateListener(
-        //     "echo",
-        //     0,
-        //     null);
+        pChannelMgr.CreateListener(
+            "MyChannel",
+            0,
+            this);
     }
 
     public void Connected()
@@ -116,9 +120,19 @@ internal partial class WTSPlugin : IWTSPlugin
         Log("Terminated");
     }
 
+    public IWTSVirtualChannelCallback? OnNewChannelConnection(
+        IWTSVirtualChannel pChannel,
+        string data,
+        out bool pbAccept)
+    {
+        Log($"OnNewChannelConnection");
+        pbAccept = true;
+        return new WTSVirtualChannelCallback(pChannel);
+    }
+
     private void Log(string msg)
     {
-        string logPath = Path.Combine(AppContext.BaseDirectory, "WTSPlugin-log.txt");
+        string logPath = @"C:\temp\ProcessVirtualChannel\WTSPlugin-log.txt";
         _log ??= new(logPath, false);
         string now = DateTime.Now.ToString("[HH:mm:ss.fff]");
         _log.WriteLine($"{now} - {msg}");
