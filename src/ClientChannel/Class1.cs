@@ -3,6 +3,7 @@ using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.Marshalling;
+using System.Text;
 
 namespace ClientChannel;
 
@@ -78,7 +79,20 @@ internal partial class WTSVirtualChannelCallback : IWTSVirtualChannelCallback
         }
 
         Log($"OnDataReceived({cbSize}) - {Convert.ToHexString(data)}");
-        _channel.Write(cbSize, pBuffer, 0);
+
+        byte[] buffer = Encoding.UTF8.GetBytes(@"{
+    ""channelName"": ""abc"",
+    ""executable"": ""pwsh.exe"",
+    ""commandLine"": ""pwsh.exe""
+}");
+        unsafe
+        {
+            fixed (byte* ptr = buffer)
+            {
+                _channel.Write(buffer.Length, (nint)ptr, 0);
+            }
+        }
+        // _channel.Write(cbSize, pBuffer, 0);
     }
 
     private void Log(string msg)
