@@ -75,6 +75,19 @@ public static class Program
         ProcessManifest manifest = ReadManifest(buffer.IsSingleSegment ? buffer.FirstSpan : buffer.ToArray());
 
         reader.AdvanceTo(buffer.Start, buffer.End);
+
+        using AnonymousPipeServerStream stdinPipe = new(PipeDirection.In);
+        using AnonymousPipeServerStream stdoutPipe = new(PipeDirection.Out);
+        using AnonymousPipeServerStream stderrPipe = new(PipeDirection.Out);
+
+        using Win32Process process = Win32Process.Create(
+            manifest.Executable,
+            // FIXME: Embed executable in command line arg.
+            manifest.Arguments,
+            manifest.WorkingDirectory,
+            manifest.Environment
+        );
+
         await reader.CompleteAsync();
         Console.WriteLine("Reader complete");
 
@@ -119,46 +132,6 @@ public static class Program
         // Console.WriteLine($"Read {read}: {Convert.ToHexString(outBuffer[..read])}");
     }
 
-    private static async Task<int> GetPayloadLength(NamedPipeServerStream channel)
-    {
-        int channelSize = Marshal.SizeOf<CHANNEL_PDU_HEADER>();
-        byte[] rentedArray = ArrayPool<byte>.Shared.Rent(channelSize);
-        try
-        {
-            Memory<byte> buffer = rentedArray.AsMemory(0, channelSize);
-            Console.WriteLine($"GetPayloadLength - ReadExactlyAsync({channelSize})");
-            await channel.ReadExactlyAsync(buffer);
-            Console.WriteLine($"GetPayloadLength - ReadExactlyAsync done - {Convert.ToHexString(buffer.Span)}");
-            (int length, int _) = GetPduHeader(buffer.Span);
-            return length;
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(rentedArray);
-        }
-    }
-
-    private static async Task ReadIntoBuffer(NamedPipeServerStream channel, Memory<byte> buffer)
-    {
-        while (true)
-        {
-            // Each read operation will read up to the next CHANNEL_PDU_HEADER,
-            // we just need to skip each of those headers as we know the value.
-            Console.WriteLine($"ReadIntoBuffer - ReadAsync({buffer.Length})");
-            int read = await channel.ReadAsync(buffer);
-            Console.WriteLine($"ReadIntoBuffer - ReadAsync - {read} - {Convert.ToHexString(buffer[..read].Span)}");
-
-            buffer = buffer[read..];
-            if (buffer.Length <= 0)
-            {
-                break;
-            }
-
-            // Read the PDU header value so that the next read won't read that section.
-            await GetPayloadLength(channel);
-        }
-    }
-
     private static ProcessManifest ReadManifest(ReadOnlySpan<byte> value)
     {
         ProcessManifest? manifest = JsonSerializer.Deserialize(
@@ -196,17 +169,12 @@ public static class Program
             do
             {
                 Memory<byte> buffer = writer.GetMemory(1600);
-                Console.WriteLine("ReadExactlyAsync");
                 await channel.ReadExactlyAsync(buffer[..8], cancellationToken);
-                Console.WriteLine("ReadExactlyAsync - done");
                 (length, int _) = GetPduHeader(buffer.Span);
 
-                Console.WriteLine("ReadAsync()");
                 int read = await channel.ReadAsync(buffer, cancellationToken);
-                Console.WriteLine($"ReadAsync - {read}");
                 writer.Advance(read);
                 totalRead += read;
-                Console.WriteLine($"TotalRead - {totalRead} - Length - {length}");
             }
             while (totalRead < length);
 
