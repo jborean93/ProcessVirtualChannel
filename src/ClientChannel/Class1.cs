@@ -80,11 +80,15 @@ internal partial class WTSVirtualChannelCallback : IWTSVirtualChannelCallback
 
         Log($"OnDataReceived({cbSize}) - {Convert.ToHexString(data)}");
 
-        byte[] buffer = Encoding.UTF8.GetBytes(@"{
-    ""channelName"": ""abc"",
-    ""executable"": ""pwsh.exe"",
-    ""commandLine"": ""pwsh.exe""
-}");
+        string longVar = new('a', 4096);
+        string inJson = @"{{
+            ""ChannelName"": ""abc"",
+            ""Executable"": ""pwsh.exe"",
+            ""CommandLine"": ""pwsh.exe"",
+            ""WorkingDirectory"": ""{0}""
+        }}";
+        byte[] buffer = Encoding.UTF8.GetBytes(string.Format(inJson, longVar));
+        Log($"Writing {inJson.Length} - {buffer.Length}\n{inJson}");
         unsafe
         {
             fixed (byte* ptr = buffer)
@@ -93,6 +97,7 @@ internal partial class WTSVirtualChannelCallback : IWTSVirtualChannelCallback
             }
         }
         // _channel.Write(cbSize, pBuffer, 0);
+        return;
     }
 
     private void Log(string msg)

@@ -1,6 +1,7 @@
 using System;
 using System.ComponentModel;
 using System.IO;
+using System.IO.Pipes;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 using ServerChannel.Native;
@@ -52,7 +53,7 @@ public static class VirtualChannel
     public static SafeVirtualChannelHandle OpenStaticChannel(string name, int sessionId)
         => OpenChannelCore(sessionId, name, 0);
 
-    public static FileStream GetStream(SafeVirtualChannelHandle channel)
+    public static NamedPipeServerStream GetStream(SafeVirtualChannelHandle channel)
     {
         if (channel.IsInvalid || channel.IsClosed)
         {
@@ -88,8 +89,11 @@ public static class VirtualChannel
                 false,
                 Kernel32.DUPLICATE_SAME_ACCESS);
 
-            SafeFileHandle fsHandle = new(fileHandle, true);
-            return new(fsHandle, FileAccess.ReadWrite, 0, true);
+            // We use a pipe as it can handle non buffered reads in sections.
+            // Using FileStream will result in "More data is available" on a
+            // read that doesn't read the whole buffer.
+            SafePipeHandle fsHandle = new(fileHandle, true);
+            return new(PipeDirection.InOut, true, true, fsHandle);
         }
         finally
         {
