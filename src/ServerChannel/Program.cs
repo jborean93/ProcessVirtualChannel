@@ -1,7 +1,7 @@
 ﻿using System;
 using System.Buffers;
 using System.Collections.Generic;
-using System.Diagnostics;
+using System.Diagnostics.Tracing;
 using System.IO;
 using System.IO.Pipelines;
 using System.IO.Pipes;
@@ -14,6 +14,21 @@ using System.Threading.Tasks;
 
 namespace ServerChannel;
 
+
+[EventSource(Name = "ServerChannel")]
+public sealed class ServerChannelManifest : EventSource
+{
+    public static ServerChannelManifest Log = new();
+
+    private ServerChannelManifest()
+        : base(EventSourceSettings.EtwSelfDescribingEventFormat) // Needed for AOT
+    { }
+
+    [Event(1, Message = "{0}")]
+    public void Info(string msg)
+        => WriteEvent(1, msg);
+}
+
 public static class Program
 {
     public static async Task Main(params string[] args)
@@ -24,119 +39,162 @@ public static class Program
             channelName = args[0];
         }
 
-        Console.WriteLine($"Opening {channelName} channel");
-        NamedPipeServerStream fs;
-        using (SafeVirtualChannelHandle channel = VirtualChannel.OpenDynamicChannel(channelName))
-        {
-            fs = VirtualChannel.GetStream(channel);
-        }
-        using (fs)
-        {
-            await RunWithStream(fs);
-        }
+        ServerChannelManifest.Log.Info($"Opening {channelName} channel");
+        using NamedPipeServerStream channel = CreateChannelStream(channelName);
+        await RunWithStream(channel);
+
+        ServerChannelManifest.Log.Info("Exiting");
     }
 
-    private static async Task RunWithStream(NamedPipeServerStream fs)
+    private static async Task RunWithStream(NamedPipeServerStream channel)
     {
-        /*
-        + Read input for manifest to run
-            + Channel name
-            + Executable - command line
-            + WorkingDir
-            + Environment
-            + ECDA public secret?
-        + Create pipes for stdio
-        + Start a new thread for each stdio
-            + Start new channel with "$ChannelName-std..." for each stdio pipe
-            + Process accordingly
-        + Start process
-        + Send back proc info (pid, tid)
-        + Resume process
-        + Wait for process exit
-        + Send back return code
-        + Loop back until process ends
-        */
         // The server must write for the client to send data.
-        Console.WriteLine("Writing");
-        byte[] test = Encoding.UTF8.GetBytes("Testing 1");
-        await fs.WriteAsync(test);
+        await channel.WriteAsync(new byte[1] { 0 });
 
         CancellationTokenSource cancelSource = new();
         Pipe pipe = new();
-        Task readerTask = Task.Run(() => PumpPipe(fs, pipe.Writer, cancelSource.Token));
+        Task readerTask = Task.Run(() => PumpPipe(channel, pipe.Writer, cancelSource.Token));
 
+        ServerChannelManifest.Log.Info("Reading input manifest data");
         PipeReader reader = pipe.Reader;
-        Console.WriteLine("Reader read");
         ReadResult result = await reader.ReadAsync();
-        Console.WriteLine($"Reader read done - {result.Buffer.Length}");
         ReadOnlySequence<byte> buffer = result.Buffer;
 
-        Console.WriteLine($"Read IsSingleSegment - {buffer.IsSingleSegment}");
         ProcessManifest manifest = ReadManifest(buffer.IsSingleSegment ? buffer.FirstSpan : buffer.ToArray());
-
         reader.AdvanceTo(buffer.Start, buffer.End);
+        ServerChannelManifest.Log.Info($"Process manifest: {manifest}");
 
-        using AnonymousPipeServerStream stdinPipe = new(PipeDirection.In);
-        using AnonymousPipeServerStream stdoutPipe = new(PipeDirection.Out);
-        using AnonymousPipeServerStream stderrPipe = new(PipeDirection.Out);
-
-        using Win32Process process = Win32Process.Create(
-            manifest.Executable,
-            // FIXME: Embed executable in command line arg.
-            manifest.Arguments,
-            manifest.WorkingDirectory,
-            manifest.Environment
-        );
+        await RunProcess(channel, manifest);
 
         await reader.CompleteAsync();
-        Console.WriteLine("Reader complete");
 
         cancelSource.Cancel();
         try
         {
+            ServerChannelManifest.Log.Info("Awaiting main reader to end");
             await readerTask;
         }
         catch (OperationCanceledException)
         { }
+    }
 
-        Console.WriteLine(manifest);
-        Console.WriteLine(manifest.WorkingDirectory.Length);
+    private static async Task RunProcess(NamedPipeServerStream channel, ProcessManifest manifest)
+    {
+        using CancellationTokenSource cancelSource = new();
+        ServerChannelManifest.Log.Info($"Creating {manifest.ChannelName}-stdin");
+        using NamedPipeServerStream stdinChannel = CreateChannelStream($"{manifest.ChannelName}-stdin");
+        ServerChannelManifest.Log.Info($"Creating {manifest.ChannelName}-stdout");
+        using NamedPipeServerStream stdoutChannel = CreateChannelStream($"{manifest.ChannelName}-stdout");
+        ServerChannelManifest.Log.Info($"Creating {manifest.ChannelName}-stderr");
+        using NamedPipeServerStream stderrChannel = CreateChannelStream($"{manifest.ChannelName}-stderr");
 
-        // int payloadSize = await GetPayloadLength(fs);
-        // byte[] rentedArray = ArrayPool<byte>.Shared.Rent(payloadSize);
-        // try
-        // {
-        //     Memory<byte> buffer = rentedArray.AsMemory(0, payloadSize);
-        //     await ReadIntoBuffer(fs, buffer);
+        using AnonymousPipeServerStream stdinPipe = new(PipeDirection.Out, HandleInheritability.Inheritable);
+        using AnonymousPipeServerStream stdoutPipe = new(PipeDirection.In, HandleInheritability.Inheritable);
+        using AnonymousPipeServerStream stderrPipe = new(PipeDirection.In, HandleInheritability.Inheritable);
 
-        //     string inJson = Encoding.UTF8.GetString(buffer.Span);
-        //     Console.WriteLine($"Input json: {inJson}");
+        Task stdinTask = Task.Run(() => PumpProcessInput(stdinPipe, stdinChannel, cancelSource.Token));
+        Task stdoutTask = Task.Run(() => PumpProcessOutput(stdoutPipe, stdoutChannel, cancelSource.Token));
+        Task stderrTask = Task.Run(() => PumpProcessOutput(stderrPipe, stderrChannel, cancelSource.Token));
 
-        //     ProcessManifest? manifest = JsonSerializer.Deserialize(
-        //         inJson,
-        //         ProcessManifestSourceGenerationContext.Default.ProcessManifest);
+        StringBuilder commandLine = new($"\"{manifest.Executable}\"");
+        if (!string.IsNullOrWhiteSpace(manifest.Arguments))
+        {
+            commandLine.AppendFormat(" {0}", manifest.Arguments);
+        }
+        ServerChannelManifest.Log.Info($"Starting process");
+        using Win32Process process = Win32Process.Create(
+            manifest.Executable,
+            commandLine.ToString(),
+            manifest.WorkingDirectory,
+            manifest.Environment,
+            stdinPipe.ClientSafePipeHandle,
+            stdoutPipe.ClientSafePipeHandle,
+            stderrPipe.ClientSafePipeHandle);
 
-        // }
-        // finally
-        // {
-        //     ArrayPool<byte>.Shared.Return(rentedArray);
-        // }
+        stdinPipe.DisposeLocalCopyOfClientHandle();
+        stdoutPipe.DisposeLocalCopyOfClientHandle();
+        stderrPipe.DisposeLocalCopyOfClientHandle();
 
-        // ProcessManifest manifest = await ReadManifest(fs);
+        ProcessInfo processInfo = new(process.ProcessId, process.ThreadId);
+        ServerChannelManifest.Log.Info($"Writing new process info {processInfo}");
+        // await JsonSerializer.SerializeAsync(
+        //     channel,
+        //     processInfo,
+        //     SourceGenerationContext.Default.ProcessInfo);
 
-        // Console.WriteLine("Writing");
-        // fs.Write("Testing 2"u8);
+        ServerChannelManifest.Log.Info("Waiting for process to end");
+        int rc = await process.WaitForExitAsync();
+        ServerChannelManifest.Log.Info($"Process ended with {rc}");
+        cancelSource.Cancel();
 
-        // Console.WriteLine("Reading");
-        // read = fs.Read(outBuffer);
-        // Console.WriteLine($"Read {read}: {Convert.ToHexString(outBuffer[..read])}");
+        ServerChannelManifest.Log.Info("Awaiting stdin task");
+        await stdinTask;
+        ServerChannelManifest.Log.Info("Awaiting stdout task");
+        await stdoutTask;
+        ServerChannelManifest.Log.Info("Awaiting stderr task");
+        await stderrTask;
+
+        ProcessResult procRes = new(ReturnCode: rc);
+        ServerChannelManifest.Log.Info($"Writing process result {procRes}");
+        // await JsonSerializer.SerializeAsync(
+        //     channel,
+        //     procRes,
+        //     SourceGenerationContext.Default.ProcessResult);
+    }
+
+    private static NamedPipeServerStream CreateChannelStream(string name)
+    {
+        using (SafeVirtualChannelHandle channel = VirtualChannel.OpenDynamicChannel(name))
+        {
+            return VirtualChannel.GetStream(channel);
+        }
+    }
+
+    private static async Task PumpProcessOutput(
+        AnonymousPipeServerStream pipe,
+        NamedPipeServerStream channel,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await pipe.CopyToAsync(channel, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        { }
+    }
+
+    private static async Task PumpProcessInput(
+        AnonymousPipeServerStream pipe,
+        NamedPipeServerStream channel,
+        CancellationToken cancellationToken)
+    {
+        // The server must write for the client to send data.
+        await channel.WriteAsync(new byte[1] { 0 });
+
+        Pipe pipeline = new();
+        Task pumpTask = Task.Run(() => PumpPipe(channel, pipeline.Writer, cancellationToken));
+        try
+        {
+            await pipeline.Reader.CopyToAsync(pipe, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        { }
+
+        await pipeline.Reader.CompleteAsync();
+
+        try
+        {
+            await pumpTask;
+        }
+        catch (OperationCanceledException)
+        { }
     }
 
     private static ProcessManifest ReadManifest(ReadOnlySpan<byte> value)
     {
         ProcessManifest? manifest = JsonSerializer.Deserialize(
             value,
-            ProcessManifestSourceGenerationContext.Default.ProcessManifest);
+            SourceGenerationContext.Default.ProcessManifest);
         if (manifest == null || manifest.ChannelName is null || manifest.Executable is null)
         {
             throw new InvalidOperationException($"Invalid JSON provided");
@@ -151,7 +209,6 @@ public static class Program
             fixed (byte* ptr = buffer)
             {
                 CHANNEL_PDU_HEADER* header = (CHANNEL_PDU_HEADER*)ptr;
-                Console.WriteLine($"CHANNEL_PDU_HEADER(length: {header->length}, flags: {header->flags})");
                 return (header->length, header->flags);
             }
         }
@@ -198,7 +255,9 @@ internal struct CHANNEL_PDU_HEADER
 }
 
 [JsonSerializable(typeof(ProcessManifest))]
-internal partial class ProcessManifestSourceGenerationContext : JsonSerializerContext
+[JsonSerializable(typeof(ProcessInfo))]
+[JsonSerializable(typeof(ProcessResult))]
+internal partial class SourceGenerationContext : JsonSerializerContext
 { }
 
 public record ProcessManifest(
@@ -209,4 +268,16 @@ public record ProcessManifest(
     string? Arguments,
     string? WorkingDirectory,
     Dictionary<string, string>? Environment
+);
+
+public record ProcessInfo(
+    [property: JsonRequired]
+    int ProcessId,
+    [property: JsonRequired]
+    int ThreadId
+);
+
+public record ProcessResult(
+    [property: JsonRequired]
+    int ReturnCode
 );

@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Win32.SafeHandles;
 using ServerChannel.Native;
 
@@ -15,6 +17,14 @@ internal sealed class Win32Process : IDisposable
     public SafeProcessHandle ProcessHandle { get; }
     public SafeProcessHandle ThreadHandle { get; }
 
+    private sealed class ProcessWaitHandle : WaitHandle
+    {
+        public ProcessWaitHandle(SafeProcessHandle handle)
+        {
+            SafeWaitHandle = new(handle.DangerousGetHandle(), false);
+        }
+    }
+
     private Win32Process(ref Kernel32.PROCESS_INFORMATION pi)
     {
         ProcessId = pi.dwProcessId;
@@ -23,11 +33,37 @@ internal sealed class Win32Process : IDisposable
         ThreadHandle = new(pi.hThread, true);
     }
 
+    public async Task<int> WaitForExitAsync()
+    {
+        ProcessWaitHandle waitHandle = new(ProcessHandle);
+        TaskCompletionSource tcs = new();
+        RegisteredWaitHandle taskWaitHandle = ThreadPool.RegisterWaitForSingleObject(
+            waitHandle,
+            (s, t) => tcs.SetResult(),
+            null,
+            -1,
+            true);
+
+        await tcs.Task;
+
+        taskWaitHandle.Unregister(waitHandle);
+
+        if (!Kernel32.GetExitCodeProcess(ProcessHandle.DangerousGetHandle(), out var rc))
+        {
+            throw new Win32Exception();
+        }
+
+        return rc;
+    }
+
     public static Win32Process Create(
         string? applicationName,
         string? commandLine,
         string? workingDirectory,
-        Dictionary<string, string>? environment)
+        Dictionary<string, string>? environment,
+        SafeHandle? stdinPipe,
+        SafeHandle? stdoutPipe,
+        SafeHandle? stderrPipe)
     {
         int creationFlags = Kernel32.CREATE_NEW_CONSOLE |
             Kernel32.CREATE_UNICODE_ENVIRONMENT |
@@ -37,10 +73,39 @@ internal sealed class Win32Process : IDisposable
             StartupInfo = new()
             {
                 cb = Marshal.SizeOf<Kernel32.STARTUPINFOEXW>(),
-                dwFlags = Kernel32.STARTF_USESTDHANDLES,
             }
         };
         Kernel32.PROCESS_INFORMATION processInfo;
+
+        if (stdinPipe != null)
+        {
+            if (stdinPipe.IsInvalid || stdinPipe.IsClosed)
+            {
+                throw new ArgumentException("Stdin SafeHandle is close or invalid", nameof(stdinPipe));
+            }
+            startupInfo.StartupInfo.dwFlags |= Kernel32.STARTF_USESTDHANDLES;
+            startupInfo.StartupInfo.hStdInput = stdinPipe.DangerousGetHandle();
+        }
+
+        if (stdoutPipe != null)
+        {
+            if (stdoutPipe.IsInvalid || stdoutPipe.IsClosed)
+            {
+                throw new ArgumentException("Stdout SafeHandle is close or invalid", nameof(stdoutPipe));
+            }
+            startupInfo.StartupInfo.dwFlags |= Kernel32.STARTF_USESTDHANDLES;
+            startupInfo.StartupInfo.hStdOutput = stdoutPipe.DangerousGetHandle();
+        }
+
+        if (stderrPipe != null)
+        {
+            if (stderrPipe.IsInvalid || stderrPipe.IsClosed)
+            {
+                throw new ArgumentException("Stderr SafeHandle is close or invalid", nameof(stderrPipe));
+            }
+            startupInfo.StartupInfo.dwFlags |= Kernel32.STARTF_USESTDHANDLES;
+            startupInfo.StartupInfo.hStdError = stderrPipe.DangerousGetHandle();
+        }
 
         string? envBlock = null;
         if (environment?.Count > 0)
@@ -66,7 +131,7 @@ internal sealed class Win32Process : IDisposable
                     commandLinePtr,
                     IntPtr.Zero,
                     IntPtr.Zero,
-                    false,
+                    true,  // TODO: Pass in only stdio handles through the ProcThreadAttributeList
                     creationFlags,
                     envPtr,
                     workingDirPtr,

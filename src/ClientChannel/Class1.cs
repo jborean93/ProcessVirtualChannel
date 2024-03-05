@@ -1,9 +1,12 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.Marshalling;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace ClientChannel;
 
@@ -33,6 +36,28 @@ internal partial interface IWTSListenerCallback
         [MarshalAs(UnmanagedType.Bool)] out bool pbAccept);
 }
 
+[GeneratedComClass]
+internal partial class WTSListenerCallbackDelegate : IWTSListenerCallback
+{
+    private readonly OnNewChannelConnectionDelegate _callback;
+    public delegate IWTSVirtualChannelCallback? OnNewChannelConnectionDelegate(IWTSVirtualChannel channel);
+
+    public WTSListenerCallbackDelegate(OnNewChannelConnectionDelegate callback)
+    {
+        _callback = callback;
+    }
+
+    public IWTSVirtualChannelCallback? OnNewChannelConnection(
+        IWTSVirtualChannel pChannel,
+        string data,
+        out bool pbAccept)
+    {
+        IWTSVirtualChannelCallback? result = _callback(pChannel);
+        pbAccept = result != null;
+        return result;
+    }
+}
+
 [GeneratedComInterface]
 [Guid("a1230205-d6a7-11d8-b9fd-000bdbd1f198")]
 internal partial interface IWTSVirtualChannelManager
@@ -57,12 +82,19 @@ internal partial interface IWTSPlugin
 [GeneratedComClass]
 internal partial class WTSVirtualChannelCallback : IWTSVirtualChannelCallback
 {
+    private readonly IWTSVirtualChannelManager _manager;
     private readonly IWTSVirtualChannel _channel;
+    private readonly string _purpose;
     internal StreamWriter? _log;
 
-    public WTSVirtualChannelCallback(IWTSVirtualChannel channel)
+    public WTSVirtualChannelCallback(
+        IWTSVirtualChannelManager manager,
+        IWTSVirtualChannel channel,
+        string purpose)
     {
+        _manager = manager;
         _channel = channel;
+        _purpose = purpose;
     }
 
     public void OnClose()
@@ -77,17 +109,67 @@ internal partial class WTSVirtualChannelCallback : IWTSVirtualChannelCallback
         {
             data = new((void*)pBuffer, cbSize);
         }
+        Log($"OnDataReceived({cbSize}) - {_purpose} - {Convert.ToHexString(data)}");
 
-        Log($"OnDataReceived({cbSize}) - {Convert.ToHexString(data)}");
+        switch (_purpose)
+        {
+            case "process":
+                Process();
+                break;
 
-        string longVar = new('a', 4096);
-        string inJson = @"{{
-            ""ChannelName"": ""abc"",
-            ""Executable"": ""pwsh.exe"",
-            ""CommandLine"": ""pwsh.exe"",
-            ""WorkingDirectory"": ""{0}""
-        }}";
-        byte[] buffer = Encoding.UTF8.GetBytes(string.Format(inJson, longVar));
+            case "stdin":
+                Stdin();
+                break;
+
+            case "stdout":
+                Stdout("STDOUT", data);
+                break;
+
+            case "stderr":
+                Stdout("STDERR", data);
+                break;
+        }
+    }
+
+    private void Process()
+    {
+        string channelName = "TestChannel";
+        _manager.CreateListener(
+            $"{channelName}-stdin",
+            0,
+            new WTSListenerCallbackDelegate((c) =>
+            {
+                Log($"OnNewChannelConnection - {channelName}-stdin");
+                return new WTSVirtualChannelCallback(_manager, c, "stdin");
+            }));
+        _manager.CreateListener(
+            $"{channelName}-stdout",
+            0,
+            new WTSListenerCallbackDelegate((c) =>
+            {
+                Log($"OnNewChannelConnection - {channelName}-stdout");
+                return new WTSVirtualChannelCallback(_manager, c, "stdout");
+            }));
+        _manager.CreateListener(
+            $"{channelName}-stderr",
+            0,
+            new WTSListenerCallbackDelegate((c) =>
+            {
+                Log($"OnNewChannelConnection - {channelName}-stderr");
+                return new WTSVirtualChannelCallback(_manager, c, "stderr");
+            }));
+
+        ProcessManifest manifest = new(
+            ChannelName: channelName,
+            Executable: @"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            Arguments: "-Command -",
+            WorkingDirectory: null,
+            Environment: null);
+        string inJson = JsonSerializer.Serialize(
+            manifest,
+            SourceGenerationContext.Default.ProcessManifest);
+
+        byte[] buffer = Encoding.UTF8.GetBytes(inJson);
         Log($"Writing {inJson.Length} - {buffer.Length}\n{inJson}");
         unsafe
         {
@@ -96,13 +178,39 @@ internal partial class WTSVirtualChannelCallback : IWTSVirtualChannelCallback
                 _channel.Write(buffer.Length, (nint)ptr, 0);
             }
         }
-        // _channel.Write(cbSize, pBuffer, 0);
         return;
+    }
+
+    private void Stdin()
+    {
+        string msg = @". {
+    ""ProcessId: $pid""
+    $host.UI.WriteLine('stdout')
+    $host.UI.WriteErrorLine('stderr')
+
+    exit 1
+}
+
+";
+        Span<byte> data = Encoding.UTF8.GetBytes(msg);
+        unsafe
+        {
+            fixed (byte* dataPtr = data)
+            {
+                _channel.Write(data.Length, (nint)dataPtr, 0);
+            }
+        }
+    }
+
+    private void Stdout(string stream, ReadOnlySpan<byte> data)
+    {
+        string msg = Encoding.UTF8.GetString(data);
+        Log($"{stream}: {msg}");
     }
 
     private void Log(string msg)
     {
-        string logPath = @"C:\temp\ProcessVirtualChannel\WTSVirtualChannelCallback-log.txt";
+        string logPath = string.Format(@"C:\temp\ProcessVirtualChannel\WTSVirtualChannelCallback-{0}-log.txt", _purpose);
         _log ??= new(logPath, false);
         string now = DateTime.Now.ToString("[HH:mm:ss.fff]");
         _log.WriteLine($"{now} - {msg}");
@@ -111,7 +219,7 @@ internal partial class WTSVirtualChannelCallback : IWTSVirtualChannelCallback
 }
 
 [GeneratedComClass]
-internal partial class WTSPlugin : IWTSPlugin, IWTSListenerCallback
+internal partial class WTSPlugin : IWTSPlugin
 {
     internal StreamWriter? _log;
 
@@ -121,7 +229,11 @@ internal partial class WTSPlugin : IWTSPlugin, IWTSListenerCallback
         pChannelMgr.CreateListener(
             "MyChannel",
             0,
-            this);
+            new WTSListenerCallbackDelegate((c) =>
+            {
+                Log("OnNewChannelConnection - MyChannel");
+                return new WTSVirtualChannelCallback(pChannelMgr, c, "process");
+            }));
     }
 
     public void Connected()
@@ -137,16 +249,6 @@ internal partial class WTSPlugin : IWTSPlugin, IWTSListenerCallback
     public void Terminated()
     {
         Log("Terminated");
-    }
-
-    public IWTSVirtualChannelCallback? OnNewChannelConnection(
-        IWTSVirtualChannel pChannel,
-        string data,
-        out bool pbAccept)
-    {
-        Log($"OnNewChannelConnection");
-        pbAccept = true;
-        return new WTSVirtualChannelCallback(pChannel);
     }
 
     private void Log(string msg)
@@ -184,3 +286,31 @@ internal static class DVCClient
         return 0;
     }
 }
+
+[JsonSerializable(typeof(ProcessManifest))]
+[JsonSerializable(typeof(ProcessInfo))]
+[JsonSerializable(typeof(ProcessResult))]
+internal partial class SourceGenerationContext : JsonSerializerContext
+{ }
+
+public record ProcessManifest(
+    [property: JsonRequired]
+    string ChannelName,
+    [property: JsonRequired]
+    string Executable,
+    string? Arguments,
+    string? WorkingDirectory,
+    Dictionary<string, string>? Environment
+);
+
+public record ProcessInfo(
+    [property: JsonRequired]
+    int ProcessId,
+    [property: JsonRequired]
+    int ThreadId
+);
+
+public record ProcessResult(
+    [property: JsonRequired]
+    int ReturnCode
+);

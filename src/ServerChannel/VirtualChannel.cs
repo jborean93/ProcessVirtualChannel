@@ -1,6 +1,5 @@
 using System;
 using System.ComponentModel;
-using System.IO;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
@@ -109,7 +108,15 @@ public static class VirtualChannel
         nint channelHandle = WtsApi32.WTSVirtualChannelOpenEx(sessionId, name, flags);
         if (channelHandle == IntPtr.Zero)
         {
-            throw new Win32Exception();
+            int err = Marshal.GetLastPInvokeError();
+            if (err == 0x0000001F) // ERROR_GEN_FAILURE - error used when the channel does not exist.
+            {
+                throw new ArgumentException($"VirtualChannel '{name}' does not exist", nameof(name));
+            }
+            else
+            {
+                throw new Win32Exception(err);
+            }
         }
 
         return new(channelHandle);
